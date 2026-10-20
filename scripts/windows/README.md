@@ -1,61 +1,84 @@
-# MongoDB Windows Service Error 1053
+# Windows MongoDB / File Meta Scripts
 
-Windows error **1053** (`The service did not respond to the start or control request in a timely fashion`) means `mongod.exe` exited before the SCM received `SERVICE_RUNNING`. The service line itself is usually fine:
+## 1. Fix MongoDB service Error 1053
 
-```text
-"C:\Program Files\MongoDB\Server\8.3\bin\mongod.exe" --config "C:\Program Files\MongoDB\Server\8.3\bin\mongod.cfg" --service
-```
-
-## Root causes (MongoDB 8.3)
-
-1. Invalid `mongod.cfg` YAML (tabs, broken indentation, stray `mp:`, `security;` instead of `security:`)
-2. Missing or non-writable `storage.dbPath` / `systemLog.path` (NETWORK SERVICE cannot write under Program Files)
-3. Oversized `mongod.log`
-4. Stale `mongod.lock` after unclean shutdown
-
-## Fix (Administrator PowerShell)
+See `Fix-MongoDB-Service-1053.ps1` and `mongod.cfg`.
 
 ```powershell
-cd <repo>\scripts\windows
 powershell -ExecutionPolicy Bypass -File .\Fix-MongoDB-Service-1053.ps1
 ```
 
-Optional parameters:
+## 2. Collect file metadata (last 24 hours) → MongoDB
+
+`Collect-FileMeta-ToMongo.ps1` scans local drives for files whose `LastWriteTime` is within the last 24 hours, then **upserts** metadata into MongoDB:
+
+| Field | Description |
+|-------|-------------|
+| `fullPath` | Unique key (upsert filter) |
+| `fileName` / `directory` / `extension` | Path parts |
+| `length` | File size (bytes) |
+| `creationTimeUtc` / `lastWriteTimeUtc` / `lastAccessTimeUtc` | Timestamps |
+| `attributes` / `isReadOnly` / `isHidden` | File flags |
+| `drive` / `hostName` | Machine context |
+| `collectedAtUtc` / `lookbackHours` | Collection run metadata |
+
+**Database / collection (defaults):** `filemonitor.file_meta`
+
+### Manual run
 
 ```powershell
-.\Fix-MongoDB-Service-1053.ps1 -MongoVersion 8.3 -DbPath C:\data\db -LogPath C:\data\log\mongod.log
+# Full scan → MongoDB (requires mongosh or mongoimport + running mongod)
+powershell -ExecutionPolicy Bypass -File .\Collect-FileMeta-ToMongo.ps1
+
+# Preview only (writes JSONL, no DB write)
+.\Collect-FileMeta-ToMongo.ps1 -Roots 'C:\Users' -DryRun
+
+# Custom MongoDB target
+.\Collect-FileMeta-ToMongo.ps1 `
+  -MongoUri 'mongodb://127.0.0.1:27017' `
+  -Database filemonitor `
+  -Collection file_meta `
+  -LookbackHours 24
 ```
 
-The script will:
+Logs: `%ProgramData%\AnnoFileMetaCollector\collect-YYYYMMDD.log`
 
-- Stop the MongoDB service
-- Create `C:\data\db` and `C:\data\log`
-- Grant write access to `NETWORK SERVICE`
-- Backup and replace `mongod.cfg` with a valid config (see `mongod.cfg` in this folder)
-- Diagnose by starting `mongod` in the foreground briefly
-- Repair service `ImagePath` / account if needed
-- Start the service and ping `27017`
+Query examples (mongosh):
 
-## Manual config
+```javascript
+use filemonitor
+db.file_meta.find().limit(5)
+db.file_meta.countDocuments({})
+db.file_meta.find({ extension: '.log' }).sort({ lastWriteTimeUtc: -1 })
+```
 
-If you only want the corrected config, copy `mongod.cfg` over:
+## 3. Register Windows Scheduled Task (every 24 hours)
 
-`C:\Program Files\MongoDB\Server\8.3\bin\mongod.cfg`
-
-Then:
+Run **once as Administrator**:
 
 ```powershell
-New-Item -ItemType Directory -Force C:\data\db, C:\data\log
-icacls C:\data /grant "NT AUTHORITY\NETWORK SERVICE:(OI)(CI)F" /T
-Restart-Service MongoDB
+powershell -ExecutionPolicy Bypass -File .\Register-FileMetaCollector-Task.ps1
 ```
 
-## If it still fails
-
-Run mongod in the console to see the real error:
+Options:
 
 ```powershell
-& "C:\Program Files\MongoDB\Server\8.3\bin\mongod.exe" --config "C:\Program Files\MongoDB\Server\8.3\bin\mongod.cfg"
+# First fire at 03:00 local, then every 24 hours; limit roots
+.\Register-FileMetaCollector-Task.ps1 -StartTime 03:00 -Roots 'C:\Users,D:\'
+
+# Remove the task
+.\Register-FileMetaCollector-Task.ps1 -Unregister
 ```
 
-Check the last lines of `C:\data\log\mongod.log`.
+Task name: `Anno-FileMeta-Collector-24h` (runs as **SYSTEM**).
+
+```powershell
+Start-ScheduledTask -TaskName 'Anno-FileMeta-Collector-24h'
+Get-ScheduledTaskInfo -TaskName 'Anno-FileMeta-Collector-24h'
+```
+
+## Prerequisites
+
+1. MongoDB Windows service running (see section 1 if Error 1053)
+2. `mongosh` and/or `mongoimport` on PATH or under `C:\Program Files\MongoDB\...`
+3. Administrator rights to register the scheduled task
